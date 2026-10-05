@@ -1,0 +1,20 @@
+name: Generuj Marian TV
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: python generate_marian.py
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Odswiezenie marian.m3u"
+          file_pattern: docs/marian.m3u
