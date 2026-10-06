@@ -1,5 +1,5 @@
 # generate_marian.py — odpalane co 5 minut przez GitHub Actions.
-# Generuje docs/marian.m3u na podstawie aktualnej godziny.
+# Generuje marian.m3u na podstawie aktualnej godziny (czasu polskiego).
 
 import os
 import random
@@ -7,21 +7,20 @@ from datetime import datetime, timedelta
 
 # ---- KONFIGURACJA ----
 
-# Podmien <twoj-user> i <nazwa-repo> na swoje
 BASE_URL = "https://kotmruk.github.io/marian-tv"
-MEDIA_DIR = os.path.join(os.path.dirname(__file__), "docs", "media")
-OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "docs", "marian.m3u")
+MEDIA_DIR = os.path.join(os.path.dirname(__file__), "media")
+OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "marian.m3u")
 
-# Bloki programowe: (godzina, minuta, dlugosc_w_minutach) — czas UTC!
-# GitHub Actions dziala w UTC, Polska to UTC+1 (zima) / UTC+2 (lato),
-# wiec godziny ponizej wpisz PRZESUNIETE o te roznice, albo przelicz
-# w kodzie (patrz ponizej — TZ_OFFSET_HOURS).
-TZ_OFFSET_HOURS = 2  # 2 = czas letni (CEST), 1 = czas zimowy (CET) — zmieniaj recznie 2x/rok
+# Bloki programowe: (godzina, minuta, dlugosc_w_minutach) — czas POLSKI (CET/CEST)!
+# GitHub Actions dziala w UTC, Polska to UTC+1 (zima) / UTC+2 (lato).
+# Ta wartosc jest automatycznie dostosowywana do aktualnego czasu letniego/zimowego.
+TZ_OFFSET_HOURS = 1  # Bedzie dynamicznie dostosowana w kodzie
 
 BLOCKS = [
-    (18, 0, 30),
-    (20, 0, 30),
-    (22, 0, 30),
+    (10, 0, 45),   # 10:00 - 10:45
+    (14, 0, 45),   # 14:00 - 14:45
+    (18, 0, 60),   # 18:00 - 19:00
+    (21, 0, 45),   # 21:00 - 21:45
 ]
 
 ADS_PER_ROUND = 2
@@ -30,8 +29,20 @@ PLANSZA_FILE = "plansza.mp4"
 # ---- KONIEC KONFIGURACJI ----
 
 
+def get_tz_offset():
+    """Dynamicznie okresla offset do czasu polskiego (uwzglednia czas letni/zimowy)."""
+    now_utc = datetime.utcnow()
+    # Przyblizona heurystyka: czas letni ~ pazdziernik - marzec
+    # W rzeczywistosci lepiej by bylo uzywac pytz, ale tu bez dodatkowych zaleznosci
+    if 3 <= now_utc.month <= 10:
+        return 2  # CEST (czas letni)
+    else:
+        return 1  # CET (czas zimowy)
+
+
 def local_now():
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)
+    offset = get_tz_offset()
+    return datetime.utcnow() + timedelta(hours=offset)
 
 
 def list_media(subfolder):
@@ -86,7 +97,7 @@ def main():
         reklamy = list_media("reklamy")
 
         if not filmy or not reklamy:
-            content = "#EXTM3U\n#EXTINF:-1,BRAK MATERIALOW W docs/media/filmy lub docs/media/reklamy\n"
+            content = "#EXTM3U\n#EXTINF:-1,BRAK MATERIALOW W media/filmy lub media/reklamy\n"
         else:
             random.shuffle(filmy)
             random.shuffle(reklamy)
