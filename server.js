@@ -1,15 +1,46 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const { URL } = require('url');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const DEFAULT_TARGET = "https://meta.vcdn.biz/dab0e9e1db10fcadc4c1a18bd29121c4_megogo/live/hls/b/700_2490_4000/u_sid/0/o/156751011/rsid/b67e3736-66e3-449c-a855-3c618c5a250f/u_uid/0/u_vod/0/u_device/cms_html5/u_devicekey/_site/lip/5.173.149.85*asn/u_srvc/81255/u_did/web_5aaf9878498706b0b922a7f691015de9d5adfc267a1e1f3d76814e0d04cc3fe6/type.live/playlist.m3u8";
+const DEFAULT_TARGET = "https://meta.vcdn.biz/..."; // Twój domyślny URL
+
+// --- KONFIGURACJA BEZPIECZEŃSTWA (opcjonalna, ale zalecana) ---
+// Biała lista dozwolonych hostów, aby zapobiec SSRF.
+// Jeśli chcesz zezwolić na dowolny host, pozostaw pustą tablicę.
+const ALLOWED_HOSTS = [
+    'meta.vcdn.biz',
+    'embed.megogo.net',
+    // Dodaj inne zaufane hosty
+];
+
+function isHostAllowed(urlString) {
+    if (ALLOWED_HOSTS.length === 0) return true; // Brak restrykcji
+    try {
+        const host = new URL(urlString).hostname;
+        return ALLOWED_HOSTS.some(allowed => host === allowed || host.endsWith(`.${allowed}`));
+    } catch {
+        return false;
+    }
+}
 
 app.get('/', async (req, res) => {
     let targetUrl = req.query.url ? decodeURIComponent(req.query.url) : DEFAULT_TARGET;
 
+    // 1. Walidacja hosta (ochrona przed SSRF)
+    if (!isHostAllowed(targetUrl)) {
+        return res.status(403).send("Dostęp do tego hosta jest zabroniony.");
+    }
+
     try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 sekund timeoutu
+
         const response = await fetch(targetUrl, {
+            signal: controller.signal,
+            redirect: 'follow', // Domyślnie podąża za przekierowaniami
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                 'Referer': 'https://embed.megogo.net/',
@@ -19,33 +50,93 @@ app.get('/', async (req, res) => {
             }
         });
 
-        let bodyText = await response.text();
-        let contentType = response.headers.get('content-type') || '';
+        clearTimeout(timeoutId);
 
-        // Jeśli odpowiedź nie zaczyna się od #EXTM3U, to znaczy, że serwer zwrócił błąd (np. HTML)
-        if (!bodyText.trim().startsWith('#EXTM3U')) {
-            console.log("Ostrzeżenie: Serwer zwrócił coś innego niż playlistę HLS:", bodyText.substring(0, 200));
+        if (!response.ok) {
+            // Jeśli serwer źródłowy zwrócił błąd, przekaż go dalej
+            return res.status(response.status).send(`Błąd źródła: ${response.statusText}`);
         }
 
-        if (contentType.includes('mpegurl') || contentType.includes('text') || targetUrl.includes('.m3u8') || bodyText.trim().startsWith('#EXTM3U')) {
-            const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-            const host = req.get('host');
-            const protocol = req.protocol;
+        const contentType = response.headers.get('content-type') || '';
+        const isM3U8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl');
 
-            bodyText = bodyText.replace(/^(?!#)(.+)$/gm, (match) => {
-                let absoluteUrl = match.startsWith('http') ? match : baseUrl + match;
-                return `${protocol}://${host}/?url=${encodeURIComponent(absoluteUrl)}`;
-            });
-
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        // 2. Obsługa strumieni (segmenty, klucze, obrazy itp.)
+        if (!isM3U8) {
+            // Dla plików binarnych (np. .ts, .key) przekazujemy strumień bez buforowania
+            // i obsługujemy Range requests, jeśli są obecne.
             res.setHeader('Access-Control-Allow-Origin', '*');
-            return res.send(bodyText);
+            const range = req.headers.range;
+            if (range) {
+                // Przekaż nagłówek Range do źródła
+                const rangeResponse = await fetch(targetUrl, {
+                    headers: { ...response.headers.raw(), 'Range': range },
+                    // ... (obsługa timeoutu i błędów)
+                });
+                if (rangeResponse.status === 206) {
+                    res.status(206);
+                    res.setHeader('Content-Range', rangeResponse.headers.get('content-range'));
+                    res.setHeader('Accept-Ranges', 'bytes');
+                }
+                return rangeResponse.body.pipe(res);
+            }
+            return response.body.pipe(res);
         }
 
+        // 3. Przetwarzanie manifestu M3U8
+        let bodyText = await response.text();
+
+        // Walidacja, czy to na pewno manifest
+        if (!bodyText.trim().startsWith('#EXTM3U')) {
+            console.warn("Ostrzeżenie: Odpowiedź nie jest prawidłowym manifestem M3U8.");
+            // Mimo to spróbujmy przepisać, bo może to być nietypowy format
+        }
+
+        const baseUrl = new URL(targetUrl);
+        const host = req.get('host');
+        const protocol = req.protocol;
+        const proxyBase = `${protocol}://${host}/?url=`;
+
+        // 4. Zaawansowane przepisywanie linii manifestu
+        bodyText = bodyText.split(/\r?\n/).map(line => {
+            const trimmedLine = line.trim();
+            if (trimmedLine === '') return line; // Puste linie pozostaw
+
+            // Przepisz atrybuty URI w tagach #EXT-X-*
+            if (trimmedLine.startsWith('#')) {
+                // Szukaj URI="..." wewnątrz tagów
+                return trimmedLine.replace(/URI="([^"]+)"/g, (match, uri) => {
+                    try {
+                        const absoluteUri = new URL(uri, baseUrl).href;
+                        return `URI="${proxyBase}${encodeURIComponent(absoluteUri)}"`;
+                    } catch {
+                        return match; // Jeśli URI jest nieprawidłowy, pozostaw bez zmian
+                    }
+                });
+            }
+
+            // Przepisz zwykłe linie z segmentami
+            try {
+                const absoluteUrl = new URL(trimmedLine, baseUrl).href;
+                return `${proxyBase}${encodeURIComponent(absoluteUrl)}`;
+            } catch {
+                return line; // Jeśli nie można sparsować, pozostaw linię
+            }
+        }).join('\n');
+
+        // 5. Ustawienie bezpiecznych nagłówków odpowiedzi
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Access-Control-Allow-Origin', '*');
+        // Usuń potencjalnie problematyczne nagłówki
+        res.removeHeader('Content-Encoding');
+        res.removeHeader('Content-Length');
+
         return res.send(bodyText);
 
     } catch (err) {
+        if (err.name === 'AbortError') {
+            return res.status(504).send("Przekroczono limit czasu oczekiwania na odpowiedź serwera źródłowego.");
+        }
+        console.error("Błąd proxy:", err);
         res.status(500).send("Błąd proxy: " + err.message);
     }
 });
